@@ -42,6 +42,7 @@ This repository includes three GitHub Actions workflow files in `.github/workflo
 
 - `sandbox.yml`
 - `release.yml`
+- `release-rollback.yml`
 - `security-scan.yml`
 
 ### sandbox.yml
@@ -53,6 +54,12 @@ The sandbox workflow deploys the application to the SANDBOX environment only. It
 > **Note:** This project assumes the main branch is named `main`, not `master`. Ensure you change this .yml file accordingly.
 
 The release workflow deploys the application to the PRODUCTION environment only. It uses production-specific credentials and is separated from sandbox deployment to ensure controlled release handling.
+
+### release-rollback.yml
+
+> **Note:** Here the workflow checks out the code using release version tag.
+
+The release rollback workflow rollsback the application in the PRODUCTION environment only. It only modifies, doesn't create a new application.
 
 ### security-scan.yml
 
