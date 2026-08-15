@@ -1,0 +1,521 @@
+name: MuleSoft Rollback - PRODUCTION
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Exchange/GitHub Release version to rollback to (e.g. 2.0.9)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  production-rollback:
+    runs-on: ubuntu-latest
+
+    environment: PRODUCTION
+
+    steps:
+
+      - name: Validate Rollback Version
+        run: |
+          ROLLBACK_VERSION="${{ inputs.version }}"
+
+          if [[ ! "$ROLLBACK_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release version: $ROLLBACK_VERSION"
+            echo "Expected format: X.Y.Z"
+            exit 1
+          fi
+          
+          # Store the rollback version in GitHub Actions environment variables for later use
+          echo "MULE_PROJECT_VERSION=$ROLLBACK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Checkout Release Rollback Tag
+        uses: actions/checkout@v5
+        with:
+          ref: v${{ inputs.version }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: corretto
+          java-version: 17
+
+      - name: Install JQ
+        run: sudo apt-get install -y jq
+
+      - name: Install XML Tools
+        run: sudo apt-get install -y libxml2-utils
+        
+      - name: Install Anypoint CLI
+        run: npm install -g anypoint-cli-v4-public
+
+      - name: Select Production Anypoint Platform Environment & Configuration
+        run: |
+          echo "Selecting Production Anypoint Platform Environment & Configuration..."
+
+          echo "ENVIRONMENT=PRODUCTION" >> "$GITHUB_ENV"
+          echo "CONFIG_FILE=anypoint-config.json" >> "$GITHUB_ENV"
+
+          echo "Configuration selected successfully"
+
+      - name: Display Selected Anypoint Platform Environment & Configuration
+        run: |
+          echo "Environment : $ENVIRONMENT"
+          echo "Config File : $CONFIG_FILE"
+
+      - name: CLI Login Check
+        run: |
+          echo "Checking Anypoint CLI login..."
+
+          anypoint-cli-v4 account:environment:list \
+            --client_id "${{ secrets.CONNECTED_APP_ID }}" \
+            --client_secret "${{ secrets.CONNECTED_APP_SECRET }}" \
+            --output json > environments.json
+
+          # cat environments.json # To print the output
+
+          echo "Status : OK"
+
+      - name: Read Project Metadata
+        run: |
+          echo "Reading pom.xml..."
+
+          ORG_ID=$(xmllint --xpath "/*[local-name()='project']/*[local-name()='groupId']/text()" pom.xml)
+
+          echo "Mule Project Organization ID : $ORG_ID"
+
+          MULE_PROJECT_ARTIFACT_ID=$(xmllint --xpath "/*[local-name()='project']/*[local-name()='artifactId']/text()" pom.xml)
+          
+          echo "Mule Project Artifact ID     : $MULE_PROJECT_ARTIFACT_ID"          
+          echo "Mule Project Version         : $MULE_PROJECT_VERSION"
+
+          # Store the extracted values in GitHub Actions environment variables for later use
+          echo "ORG_ID=$ORG_ID" >> "$GITHUB_ENV"
+          echo "MULE_PROJECT_ARTIFACT_ID=$MULE_PROJECT_ARTIFACT_ID" >> "$GITHUB_ENV"
+
+          echo "Project metadata loaded successfully"
+
+      - name: Rollback API Manager Instance
+        run: |
+          echo "Reading $CONFIG_FILE..."
+
+          # Extract assetId from configuration file
+          ASSET_ID=$(jq -r '.exchangeAssetId // ""' "$CONFIG_FILE")
+
+          if [ -z "$ASSET_ID" ]; then
+
+            echo "Exchange Asset ID not found in $CONFIG_FILE"
+            echo "Skipping API Manager Instance rollback..."
+  
+            # Store the API_MANAGER_ENABLED variable in GitHub Actions environment variables for later use
+            echo "API_MANAGER_ENABLED=false" >> $GITHUB_ENV
+            exit 0
+          
+          fi
+
+          echo "Asset ID                 : $ASSET_ID"
+          echo "Reading pom.xml..."
+
+          # Extract asset version from pom.xml file using assetId
+          ASSET_VERSION=$(xmllint --xpath "/*[local-name()='project']/*[local-name()='dependencies']/*[local-name()='dependency'][*[local-name()='artifactId']='$ASSET_ID' and *[local-name()='classifier']='raml']/*[local-name()='version']/text()" pom.xml 2>/dev/null || true)
+          
+          if [ -z "$ASSET_VERSION" ]; then
+
+            echo "RAML dependency not found in pom.xml"
+            echo "Skipping API Manager Instance rollback..."
+  
+            # Store the API_MANAGER_ENABLED variable in GitHub Actions environment variables for later use
+            echo "API_MANAGER_ENABLED=false" >> $GITHUB_ENV
+            exit 0
+
+          fi
+          
+          echo "Asset Version            : $ASSET_VERSION"
+
+          MAJOR_VERSION=$(echo "$ASSET_VERSION" | cut -d. -f1)
+          API_VERSION="v${MAJOR_VERSION}"
+
+          echo "API Version              : $API_VERSION"
+          echo "Building instance label for API Manager..."
+
+          INSTANCE_LABEL="${ENVIRONMENT}-${MULE_PROJECT_ARTIFACT_ID}-${API_VERSION}"
+          
+          echo "Instance Label           : $INSTANCE_LABEL"
+          echo "Looking for existing API instances with this label..."
+
+          anypoint-cli-v4 api-mgr:api:list \
+            --environment "$ENVIRONMENT" \
+            --instanceLabel "$INSTANCE_LABEL" \
+            --client_id "${{ secrets.CONNECTED_APP_ID }}" \
+            --client_secret "${{ secrets.CONNECTED_APP_SECRET }}" \
+            --output json > apis.json
+
+          # cat apis.json # To print the output
+
+          # Below command will only grab the id of the first one it finds. (It is possible for multiple instances to exist with the same label)
+          API_INSTANCE_ID=$(jq -r --arg asset "$ASSET_ID" '.[] | select(.assetId==$asset) | .id' apis.json | head -1) 
+          CURRENT_ASSET_VERSION=$(jq -r --arg asset "$ASSET_ID" '.[] | select(.assetId==$asset) | .assetVersion' apis.json | head -1)
+
+          if [ -z "$API_INSTANCE_ID" ] || [ "$API_INSTANCE_ID" = "null" ]; then
+
+            echo "Not found"
+            echo "Skipping API Manager rollback..."
+            
+            echo "API_MANAGER_ENABLED=false" >> "$GITHUB_ENV"
+            exit 0
+  
+          else
+
+            echo "Found Autodiscovery ID   : $API_INSTANCE_ID"
+            echo "Current Asset Version    : $CURRENT_ASSET_VERSION"
+  
+            if [ "$CURRENT_ASSET_VERSION" = "$ASSET_VERSION" ]; then
+
+              echo "RAML specification is already up-to-date with code"
+    
+            else
+
+              echo "Updating RAML Specification Version..."
+    
+              anypoint-cli-v4 api-mgr:api:change-specification \
+                "$API_INSTANCE_ID" \
+                "$ASSET_VERSION" \
+                --environment "$ENVIRONMENT" \
+                --client_id "${{ secrets.CONNECTED_APP_ID }}" \
+                --client_secret "${{ secrets.CONNECTED_APP_SECRET }}" \
+                --output json > apiramlupdate.json
+
+              # cat apiramlupdate.json # To print the output
+
+              echo "Asset Version updated to $ASSET_VERSION"
+    
+            fi
+          
+          fi
+
+          # Store the API_INSTANCE_ID and API_MANAGER_ENABLED variable in GitHub Actions environment variables for later use
+          echo "API_INSTANCE_ID=$API_INSTANCE_ID" >> $GITHUB_ENV
+          echo "API_MANAGER_ENABLED=true" >> $GITHUB_ENV
+
+      - name: Rollback Policies
+        if: env.API_MANAGER_ENABLED == 'true'
+        run: |
+          echo "Reading $CONFIG_FILE..."
+
+          POLICY_COUNT=$(jq '.policies // [] | length' "$CONFIG_FILE")
+
+          if [ "$POLICY_COUNT" -eq 0 ]; then
+
+            echo "No policies found in $CONFIG_FILE"
+            echo "Skipping Policy rollback..."
+            exit 0
+
+          fi
+
+          echo "# of Policies         : $POLICY_COUNT"
+          echo "Retrieving currently applied policies to API instance - $API_INSTANCE_ID..."
+
+          anypoint-cli-v4 api-mgr:policy:list \
+            "$API_INSTANCE_ID" \
+            --environment "$ENVIRONMENT" \
+            --client_id "${{ secrets.CONNECTED_APP_ID }}" \
+            --client_secret "${{ secrets.CONNECTED_APP_SECRET }}" \
+            --output json > appliedpolicies.json
+
+          # cat appliedpolicies.json # To print the output
+
+          APPLIED_POLICY_COUNT=$(jq 'length' appliedpolicies.json)
+
+          echo "Applied # of Policies : $APPLIED_POLICY_COUNT"
+          echo "Processing policies from $CONFIG_FILE..."
+
+          jq -c '.policies[]' "$CONFIG_FILE" | while read -r policy
+
+          do
+
+            echo "------------------------------------------"
+
+            POLICY_NAME=$(echo "$policy" | jq -r '.name')
+            
+            echo "Policy Name           : $POLICY_NAME"
+            
+            POLICY_VERSION=$(echo "$policy" | jq -r '.version')
+
+            echo "Desired Version       : $POLICY_VERSION"
+
+            POLICY_CONFIGURATION=$(echo "$policy" | jq -c '.configuration')
+
+            echo "Checking if policy is already applied..."
+
+            POLICY_ID=$(jq -r --arg name "$POLICY_NAME" '.[] | select(."Asset ID"==$name) | .ID' appliedpolicies.json)
+
+            if [ -z "$POLICY_ID" ] || [ "$POLICY_ID" = "null" ]; then
+
+              echo "Status                : Not Applied"
+              echo "Applying policy..."
+
+              anypoint-cli-v4 api-mgr:policy:apply \
+                "$API_INSTANCE_ID" \
+                "$POLICY_NAME" \
+                --policyVersion "$POLICY_VERSION" \
+                --config "$POLICY_CONFIGURATION" \
+                --environment "$ENVIRONMENT" \
+                --client_id "${{ secrets.CONNECTED_APP_ID }}" \
+                --client_secret "${{ secrets.CONNECTED_APP_SECRET }}" \
+                --output json > policyapply.json
+
+              # cat policyapply.json # To print the output
+
+              echo "Policy applied successfully"
+
+              continue
+
+            fi
+
+            CURRENT_VERSION=$(jq -r --arg name "$POLICY_NAME" '.[] | select(."Asset ID"==$name) | ."Asset Version"' appliedpolicies.json)
+
+            echo "Status                : Already Applied"
+            echo "Policy ID             : $POLICY_ID"
+            echo "Current Version       : $CURRENT_VERSION"
+
+            if [ "$CURRENT_VERSION" != "$POLICY_VERSION" ]; then
+
+              echo "Version change requires removal and re-application of the policy"
+              echo "Removing existing policy..."
+
+              anypoint-cli-v4 api-mgr:policy:remove \
+                "$API_INSTANCE_ID" \
+                "$POLICY_ID" \
+                --environment "$ENVIRONMENT" \
+                --client_id "${{ secrets.CONNECTED_APP_ID }}" \
+                --client_secret "${{ secrets.CONNECTED_APP_SECRET }}" \
+                --output json > policyremove.json
+
+              # cat policyremove.json # To print the output
+
+              echo "Policy removed successfully"
+              echo "Applying policy version $POLICY_VERSION..."
+
+              anypoint-cli-v4 api-mgr:policy:apply \
+                "$API_INSTANCE_ID" \
+                "$POLICY_NAME" \
+                --policyVersion "$POLICY_VERSION" \
+                --config "$POLICY_CONFIGURATION" \
+                --environment "$ENVIRONMENT" \
+                --client_id "${{ secrets.CONNECTED_APP_ID }}" \
+                --client_secret "${{ secrets.CONNECTED_APP_SECRET }}" \
+                --output json > policyapply.json
+
+              # cat policyapply.json # To print the output
+
+              echo "Policy updated successfully"
+
+            else
+
+              echo "Policy version is already up-to-date"
+              echo "Updating policy configuration..."
+
+              anypoint-cli-v4 api-mgr:policy:edit \
+                "$API_INSTANCE_ID" \
+                "$POLICY_ID" \
+                --config "$POLICY_CONFIGURATION" \
+                --environment "$ENVIRONMENT" \
+                --client_id "${{ secrets.CONNECTED_APP_ID }}" \
+                --client_secret "${{ secrets.CONNECTED_APP_SECRET }}" \
+                --output json > policyedit.json
+
+              # cat policyedit.json # To print the output
+
+              echo "Policy configuration updated successfully"
+
+            fi
+
+          done
+
+          echo "------------------------------------------"
+          echo "Policies Processing Complete"
+
+      - name: Create SLA Tier
+        if: env.API_MANAGER_ENABLED == 'true'
+        run: |
+          echo "Reading $CONFIG_FILE..."
+
+          SLA_KEY_COUNT=$(jq '.sla // {} | length' "$CONFIG_FILE")
+
+          if [ "$SLA_KEY_COUNT" -eq 0 ]; then
+
+            echo "No SLA configuration found in $CONFIG_FILE"
+            echo "Skipping SLA processing..."
+            exit 0
+
+          fi
+
+          SLA_NAME=$(jq -r '.sla.name' "$CONFIG_FILE")
+
+          echo "SLA Name        : $SLA_NAME"
+
+          SLA_DESCRIPTION=$(jq -r '.sla.description' "$CONFIG_FILE")
+
+          echo "Description     : $SLA_DESCRIPTION"
+
+          SLA_AUTO_APPROVE=$(jq -r '.sla.autoApprove' "$CONFIG_FILE")
+
+          echo "Auto Approve    : $SLA_AUTO_APPROVE"
+
+          SLA_LIMITS=$(jq -c '.sla.limits' "$CONFIG_FILE")
+
+          echo "Limits          : $SLA_LIMITS"
+
+          # Transform the limits into an array of arguments as per CLI command syntax
+          LIMIT_ARGS=()
+
+          while IFS= read -r limit
+          do
+
+            LIMIT_ARGS+=(
+              --limit
+              "$(echo "$limit" | jq -r '"\(.visible),\(.maximumRequests),\(.timePeriodUnit)"')"
+            )
+
+          done < <(jq -c '.sla.limits[]' "$CONFIG_FILE")
+
+          echo "Searching existing SLA Tiers..."
+
+          anypoint-cli-v4 api-mgr:tier:list \
+            "$API_INSTANCE_ID" \
+            --environment "$ENVIRONMENT" \
+            --client_id "${{ secrets.CONNECTED_APP_ID }}" \
+            --client_secret "${{ secrets.CONNECTED_APP_SECRET }}" \
+            --output json > tierlist.json
+
+          # cat tierlist.json # To print the output
+
+          TIER_ID=$(jq -r --arg name "$SLA_NAME" '.[] | select(.name==$name) | .id' tierlist.json)
+
+          if [ -n "$TIER_ID" ] && [ "$TIER_ID" != "null" ]; then
+
+            echo "$SLA_NAME Tier already exists"
+            echo "Tier ID         : $TIER_ID"
+            echo "Skipping SLA creation..."
+            exit 0
+
+          fi
+
+          echo "$SLA_NAME Tier not found"
+          echo "Creating..."
+
+          # Build the command to create the SLA tier based on the auto-approve configuration
+          if [ "$SLA_AUTO_APPROVE" = "true" ]; then
+
+            anypoint-cli-v4 api-mgr:tier:add \
+              "$API_INSTANCE_ID" \
+              --name "$SLA_NAME" \
+              --description "$SLA_DESCRIPTION" \
+              --autoApprove \
+              "${LIMIT_ARGS[@]}" \
+              --environment "$ENVIRONMENT" \
+              --client_id "${{ secrets.CONNECTED_APP_ID }}" \
+              --client_secret "${{ secrets.CONNECTED_APP_SECRET }}" \
+              --output json > tiercreate.json
+
+          else
+
+            anypoint-cli-v4 api-mgr:tier:add \
+              "$API_INSTANCE_ID" \
+              --name "$SLA_NAME" \
+              --description "$SLA_DESCRIPTION" \
+              "${LIMIT_ARGS[@]}" \
+              --environment "$ENVIRONMENT" \
+              --client_id "${{ secrets.CONNECTED_APP_ID }}" \
+              --client_secret "${{ secrets.CONNECTED_APP_SECRET }}" \
+              --output json > tiercreate.json
+
+          fi
+
+          # cat tiercreate.json # To print the output
+
+          echo "$SLA_NAME Tier created successfully"
+      
+      - name: Rollback CloudHub 2.0 Deployment
+        run: |
+          echo "Fetching deployment configuration..."
+
+          APPLICATION_NAME="${ENVIRONMENT}-${MULE_PROJECT_ARTIFACT_ID}"
+          
+          # Convert application name to lowercase to comply with CH 2.0 naming convention
+          APPLICATION_NAME="${APPLICATION_NAME,,}"
+
+          echo "CH App Name                              : $APPLICATION_NAME"
+          echo "Deployment Target                        : ${{ vars.CH_TARGET }}"
+          echo "Mule Runtime Version                     : ${{ vars.CH_MULE_VERSION }}"
+          echo "Release Channel                          : ${{ vars.CH_RELEASE_CHANNEL }}"
+          echo "Java Version                             : ${{ vars.CH_JAVA_VERSION }}"
+          echo "Number of Replicas                       : ${{ vars.CH_REPLICAS }}"
+          echo "Replica Size                             : ${{ vars.CH_VCORES }}"
+          echo "Exchange Mule Project Organization ID    : $ORG_ID"
+          echo "Exchange Mule Project Artifact ID        : $MULE_PROJECT_ARTIFACT_ID"
+          echo "Exchange Mule Project Version (Rollback) : $MULE_PROJECT_VERSION"
+
+          # Build extra arguments for Auto discovery related properties if the flag was set to true in the previous steps
+          API_MANAGER_ARGS=""
+
+          if [ "$API_MANAGER_ENABLED" = "true" ]; then
+
+            API_MANAGER_ARGS="\
+              --property api.id:$API_INSTANCE_ID \
+              --secureProperty anypoint.platform.client_id:${{ secrets.ENV_ID }} \
+              --secureProperty anypoint.platform.client_secret:${{ secrets.ENV_SECRET }}"
+
+          fi
+
+          echo "Checking if application already exists..."
+
+          anypoint-cli-v4 runtime-mgr:application:list \
+            --environment "$ENVIRONMENT" \
+            --client_id "${{ secrets.CONNECTED_APP_ID }}" \
+            --client_secret "${{ secrets.CONNECTED_APP_SECRET }}" \
+            --output json > appslist.json
+
+          # cat appslist.json # To print the output
+
+          APPLICATION_ID=$(jq -r --arg name "$APPLICATION_NAME" '.[] | select(.name == $name) | .id' appslist.json)
+
+          if [ -z "$APPLICATION_ID" ] || [ "$APPLICATION_ID" = "null" ]; then
+
+            echo "Not found"
+            echo "Rollback requires an existing CloudHub 2.0 application. Exiting..."
+            exit 1
+
+          else
+
+            echo "Found existing application"
+            echo "CH2 App ID                            : $APPLICATION_ID"
+            echo "Updating..."
+
+            anypoint-cli-v4 runtime-mgr:application:modify \
+              "$APPLICATION_ID" \
+              --runtimeVersion "${{ vars.CH_MULE_VERSION }}" \
+              --artifactId "$MULE_PROJECT_ARTIFACT_ID" \
+              --assetVersion "$MULE_PROJECT_VERSION" \
+              --groupId "$ORG_ID" \
+              --releaseChannel "${{ vars.CH_RELEASE_CHANNEL }}" \
+              --javaVersion "${{ vars.CH_JAVA_VERSION }}" \
+              --replicas "${{ vars.CH_REPLICAS }}" \
+              --replicaSize "${{ vars.CH_VCORES }}" \
+              --objectStoreV2 \
+              --environment "$ENVIRONMENT" \
+              --client_id "${{ secrets.CONNECTED_APP_ID }}" \
+              --client_secret "${{ secrets.CONNECTED_APP_SECRET }}" \
+              --property mule.env:$ENVIRONMENT \
+              --secureProperty secure.key:${{ secrets.SECURE_KEY }} \
+              $API_MANAGER_ARGS \
+              --output json > ch2modify.json
+
+            # cat ch2modify.json # To print the output
+
+            echo "Update triggered successfully"
+
+          fi
